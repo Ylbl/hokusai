@@ -87,7 +87,7 @@ impl HokusaiCanvas {
         let mut pixels = vec![255u8; (width * height * 4) as usize];
         // Fill alpha = 255 explicitly (already done by `vec![255; …]`, but be
         // explicit about it for readers).
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             px[0] = 255;
             px[1] = 255;
             px[2] = 255;
@@ -195,7 +195,7 @@ impl HokusaiCanvas {
 
 fn flatten(surface: &MemSurface, w: u32, h: u32, out: &mut [u8]) {
     // Reset to white.
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px[0] = 255;
         px[1] = 255;
         px[2] = 255;

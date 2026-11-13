@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "target/mynote-ci"
@@ -12,7 +13,16 @@ TARGET = ROOT / "target/mynote-xwin"
 command = ["cargo", "xwin", "test", "--workspace", "--all-features", "--no-run",
            "--target", "x86_64-pc-windows-msvc", "--target-dir", str(TARGET), "--message-format=json"]
 with (OUT / "build.jsonl").open("w") as stdout:
-    subprocess.run(command, cwd=ROOT, stdout=stdout, check=True)
+    compilation = subprocess.run(command, cwd=ROOT, stdout=stdout)
+if compilation.returncode:
+    for line in (OUT / "build.jsonl").read_text().splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") == "compiler-message" and message["message"]["level"] == "error":
+            print(message["message"]["rendered"], file=sys.stderr)
+    raise SystemExit(compilation.returncode)
 files = {}
 tests = []
 for line in (OUT / "build.jsonl").read_text().splitlines():
