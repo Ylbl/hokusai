@@ -821,9 +821,9 @@ where
 /// macOS/BSD libc `rand()` (Park-Miller 7^5, seed 1) — libmypaint's
 /// `get_color_pixels_accumulate` consumes it for the sparse pixel sampling
 /// it does when the sample radius exceeds 2 px. libc's state is
-/// process-global; ours is thread-local and reset per render via
-/// [`reset_get_color_rng`] so each replay matches a fresh reference
-/// process. (glibc uses a different generator — sparse sampling parity is
+/// process-global; ours is thread-local and initialized per replay via
+/// [`reset_get_color_rng`] with the recorded sampling seed.
+/// (glibc uses a different generator — sparse sampling parity is
 /// only bit-exact against a macOS/BSD-built libmypaint.)
 const C_RAND_MAX: i32 = 2147483647;
 
@@ -831,11 +831,21 @@ thread_local! {
     static C_RAND_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
-/// Reset the libc-`rand()` mirror to its fresh-process state (seed 1).
-/// Call before replaying a stroke that should match an independent
-/// libmypaint render.
+/// Reset the source-compatible reference stream to its original seed.
 pub fn reset_get_color_rng() {
     C_RAND_STATE.with(|s| s.set(1));
+}
+
+/// Explicit development-only seed; production hosts own their GPU sampler.
+#[cfg(feature = "reference-probe")]
+pub fn reset_get_color_rng_to(seed: u32) {
+    C_RAND_STATE.with(|s| s.set(u64::from(seed)));
+}
+
+/// Development-only exact state for ordered reference comparisons.
+#[cfg(feature = "reference-probe")]
+pub fn get_color_rng_state() -> u32 {
+    C_RAND_STATE.with(|s| s.get() as u32)
 }
 
 fn c_rand() -> i32 {

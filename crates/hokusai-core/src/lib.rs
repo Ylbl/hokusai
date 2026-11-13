@@ -15,6 +15,7 @@ pub mod evaluator;
 pub mod fix15;
 pub mod input;
 pub mod mapping;
+pub mod mynote_ext;
 pub mod rng;
 pub mod setting;
 pub mod spectral;
