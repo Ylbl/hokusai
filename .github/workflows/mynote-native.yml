@@ -1,0 +1,39 @@
+name: MyNote native cross-build
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+      - run: sudo apt-get update && sudo apt-get install -y clang lld
+      - run: cargo install cargo-xwin --version 0.23.1 --locked
+      - run: python3 .mynote/native_build.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mynote-native-bundle
+          path: target/mynote-ci
+          if-no-files-found: error
+  windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: mynote-native-bundle
+          path: native-bundle
+      - shell: pwsh
+        run: ./.mynote/native_run.ps1 -Bundle native-bundle
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mynote-native-results
+          path: native-bundle/native-results
+          if-no-files-found: error
