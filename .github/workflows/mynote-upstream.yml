@@ -1,0 +1,55 @@
+name: MyNote upstream sync
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_checks:
+        description: Recheck a candidate even if upstream is unchanged
+        type: boolean
+        default: false
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: ['mynote/upstream/**']
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: mynote-upstream-sync
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          fetch-depth: 0
+      - run: python3 -m pip install PyYAML==6.0.2
+      - name: Prepare and dispatch complete candidate CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_CHECKS: ${{ inputs.force_checks }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [ "$FORCE_CHECKS" = true ]; then
+            python3 .mynote/sync_upstream.py prepare --force-checks
+          else
+            python3 .mynote/sync_upstream.py prepare
+          fi
+  publish:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          fetch-depth: 0
+      - run: python3 -m pip install PyYAML==6.0.2
+      - name: Publish exactly the tested candidate without force
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .mynote/sync_upstream.py publish

@@ -1,6 +1,7 @@
 //! Per-stroke mutable state. Mirrors libmypaint's `MyPaintBrush` runtime
 //! fields so the stroke engine port can be a near-line-for-line translation.
 
+use crate::mynote_ext::StrokeContextState;
 use crate::rng::BrushRng;
 
 #[derive(Debug, Clone)]
@@ -69,9 +70,9 @@ pub struct BrushState {
     /// libmypaint's `STATE.DECLINATION` — same idea as `ascension`, for
     /// the pen's tilt declination.
     pub declination: f32,
-    /// libmypaint's `STATE.DECLINATIONX` / `DECLINATIONY`. Tilt
-    /// components in degrees (`xtilt * 60`, `ytilt * 60`), smoothed
-    /// per-dab so the per-axis input curves can ride on them.
+    /// libmypaint's `STATE.DECLINATIONX` / `DECLINATIONY`, in degrees:
+    /// `xtilt * 60` / `ytilt * 60` for nonzero tilt, both 90 without tilt.
+    /// Interpolated per simulation step.
     pub declination_x: f32,
     pub declination_y: f32,
 
@@ -147,6 +148,8 @@ pub struct BrushState {
     /// keep the trailing catch-up dabs at the same ink density the user was
     /// drawing with, rather than painting nothing at pressure=0.
     pub last_pressure: f32,
+    /// Side-loaded host context; upstream simulation state stays above.
+    pub mynote: StrokeContextState,
     /// Cached `INPUT(RANDOM)` value, mirroring libmypaint's
     /// `self->random_input`. libmypaint feeds the current value into
     /// every dab's setting evaluation and refreshes it from the PRNG
@@ -225,6 +228,7 @@ impl BrushState {
             prev_col_recentness: 0.0,
             rng: BrushRng::new(seed),
             last_pressure: 0.0,
+            mynote: StrokeContextState::default(),
             random_input: 0.0,
             started: false,
         }

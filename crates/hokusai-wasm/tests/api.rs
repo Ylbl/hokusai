@@ -64,7 +64,9 @@ fn two_events_paint_pixels() {
     let px = c.pixels();
     // At least one pixel should be non-white.
     let any_dark = px
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .any(|p| p[0] < 200 && p[1] < 200 && p[2] < 200);
     assert!(any_dark, "expected dab pixels in the stroke region");
 }

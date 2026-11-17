@@ -21,6 +21,9 @@
 use crate::brush::Brush;
 use crate::color::{hsv_to_rgb, Hsv};
 use crate::evaluator::{evaluate, InputValues, SettingValues};
+use crate::mynote_ext::{
+    degrees_c, mod_arith_c, radians_c, tilt_inputs, StrokeInputContext, TRACE_INPUTS,
+};
 use crate::setting::BrushSetting;
 use crate::state::BrushState;
 use crate::surface::{Dab, TiledSurface};
@@ -28,10 +31,12 @@ use crate::BrushInput;
 
 impl Brush {
     /// Feed one pointer event. `dtime` is seconds since the previous call.
+    /// `context` requires finite angles and finite, strictly positive zoom.
+    /// Rotation is radians; barrel rotation is turns, matching libmypaint.
     ///
     /// Returns `true` if at least one dab was painted.
     #[allow(clippy::too_many_arguments)]
-    pub fn stroke_to<S: TiledSurface>(
+    pub(crate) fn stroke_to_with_context<S: TiledSurface>(
         &self,
         state: &mut BrushState,
         surface: &mut S,
@@ -41,6 +46,7 @@ impl Brush {
         xtilt: f32,
         ytilt: f32,
         dtime: f64,
+        context: StrokeInputContext,
     ) -> bool {
         let pressure = pressure.clamp(0.0, 1.0);
         // libmypaint clamps non-positive dtime to 0.0001 *before* the skip
@@ -86,6 +92,10 @@ impl Brush {
             state.skip_last_y = 0.0;
             state.skipped_dtime = 0.0;
         }
+        // Dropped tracking-noise events do not replace the catch-up inputs.
+        state.mynote.last_input_context = context;
+        state.mynote.last_xtilt = xtilt;
+        state.mynote.last_ytilt = ytilt;
 
         // --- Fresh stroke: seed state, no dabs ------------------------------
         if !state.started || dtime >= 5.0 {
@@ -176,9 +186,7 @@ impl Brush {
             state.dabs_per_second = 0.0;
             state.actual_elliptical_ratio = 0.0;
             state.actual_elliptical_angle = 0.0;
-            // Seed the smoothed tilt state at the event's input so the
-            // first dab doesn't lerp away from a stale value.
-            let m = (xtilt * xtilt + ytilt * ytilt).sqrt().min(1.0);
+            // Reset angular state exactly like C's states[] memset.
             // libmypaint's brush_reset (mypaint-brush.c:159) zeroes the
             // entire STATE struct via memset. tilt_declination /
             // tilt_ascension only ramp toward their no-tilt defaults
@@ -191,9 +199,7 @@ impl Brush {
             state.declination = 0.0;
             state.declination_x = 0.0;
             state.declination_y = 0.0;
-            // Silence unused warnings — xtilt/ytilt/m are still in scope
-            // for later seed steps (state.X / state.Y).
-            let _ = (xtilt, ytilt, m);
+            state.mynote.barrel_rotation = 0.0;
             state.started = true;
             return false;
         }
@@ -207,22 +213,13 @@ impl Brush {
         let stroke_threshold = self.get(BrushSetting::StrokeThreshold).base_value.max(0.0);
         const STROKE_EPS: f32 = 0.0001;
 
-        // --- Tilt-derived inputs --------------------------------------------
-        // libmypaint convention (mypaint-brush.c):
-        //   declination = 90° when the pen is straight up, decreasing as the
-        //     pen tilts toward the tablet. Formula: `90 - hypot(xtilt,ytilt) * 60`.
-        //   ascension   = `atan2(-xtilt, ytilt)` in degrees.
-        // When no tilt is reported, libmypaint leaves declination at 90 and
-        // ascension at 0 — anything else makes pressure-only strokes evaluate
-        // brushes (e.g. marker_fat) as if the pen were lying flat against the
-        // tablet, which feeds wildly wrong radius/aspect values into the
-        // curves.
-        let (tilt_mag, tilt_declination, tilt_ascension) = if xtilt == 0.0 && ytilt == 0.0 {
-            (0.0, 90.0, 0.0)
-        } else {
-            let m = (xtilt * xtilt + ytilt * ytilt).sqrt().min(1.0);
-            (m, 90.0 - m * 60.0, (-xtilt).atan2(ytilt).to_degrees())
-        };
+        let (tilt_mag, tilt_declination, tilt_ascension, tilt_decl_x, tilt_decl_y) =
+            tilt_inputs(xtilt, ytilt);
+        // C:638 narrows DEGREES(radians) + 180 at mod_arith's float
+        // argument, then normalizes to [-180, 180).
+        let viewrotation =
+            mod_arith_c((degrees_c(context.view_rotation) + 180.0) as f32, 360.0) - 180.0;
+        let grid_axes = surface.gridmap_axes();
 
         // --- Constant per-dab inputs -----------------------------------------
         // Inputs that don't vary across the simulation steps of this event.
@@ -232,11 +229,12 @@ impl Brush {
         // `update_states_and_setting_values` call.
         let mut dab_inputs = InputValues::new();
         dab_inputs.set(BrushInput::Tilt, tilt_mag);
-        // `viewzoom = log(scale)` in libmypaint; with the app feeding no
-        // zoom information we sit at the neutral value (1.0× → 0).
-        dab_inputs.set(BrushInput::Viewzoom, 0.0);
-        // No barrel/twist on a plain stroke_to API, so always 0°.
-        dab_inputs.set(BrushInput::BarrelRotation, 0.0);
+        // Preserve C:711's expression/rounding rather than simplifying ln(zoom).
+        let radius_log = self.get(BrushSetting::Radius).base_value;
+        dab_inputs.set(
+            BrushInput::Viewzoom,
+            radius_log - (radius_log.exp() / context.view_zoom).ln(),
+        );
         // libmypaint feeds `BASEVAL(RADIUS_LOGARITHMIC)` directly (`ln(r)`).
         dab_inputs.set(
             BrushInput::BrushRadius,
@@ -415,9 +413,9 @@ impl Brush {
                 state.stroke_started = false;
             }
 
-            // Per-step velocity, libmypaint style (viewzoom = 1).
-            let norm_dx = step_dx / step_dtime_c;
-            let norm_dy = step_dy / step_dtime_c;
+            // C:682-687: zoom scales velocity, not stroke distance.
+            let norm_dx = step_dx / step_dtime_c * context.view_zoom;
+            let norm_dy = step_dy / step_dtime_c * context.view_zoom;
             let norm_speed = norm_dx.hypot(norm_dy);
             let norm_dist = {
                 let ndx = step_dx / step_dtime_c / base_radius;
@@ -433,12 +431,24 @@ impl Brush {
             // at the libmypaint defaults (ascension 0, declination 90).
             let step_ascension = frac * smallest_angular_diff(state.ascension, tilt_ascension);
             let step_declination = frac * (tilt_declination - state.declination);
-            let step_decl_x = frac * (xtilt * 60.0 - state.declination_x);
-            let step_decl_y = frac * (ytilt * 60.0 - state.declination_y);
+            let step_decl_x = frac * (tilt_decl_x - state.declination_x);
+            let step_decl_y = frac * (tilt_decl_y - state.declination_y);
             state.ascension += step_ascension;
             state.declination += step_declination;
             state.declination_x += step_decl_x;
             state.declination_y += step_decl_y;
+            // C:1449 / 1489: turns -> degrees before shortest-angle
+            // interpolation, including the final no-draw step.
+            let step_barrel = frac
+                * smallest_angular_diff(
+                    state.mynote.barrel_rotation,
+                    context.barrel_rotation * 360.0,
+                );
+            state.mynote.barrel_rotation += step_barrel;
+            dab_inputs.set(
+                BrushInput::BarrelRotation,
+                mod_arith_c(state.mynote.barrel_rotation, 360.0),
+            );
             // libmypaint's update_states_and_setting_values evaluates ALL
             // SETTINGS using PRE-update STATE values (line 728), then
             // updates STATE (slow_tracking_per_dab / norm_speed_slow /
@@ -475,12 +485,8 @@ impl Brush {
             );
             dab_inputs.set(BrushInput::Random, state.random_input);
 
-            // Smoothed tilt inputs: libmypaint feeds the lagged STATE
-            // values into INPUT(TILT_*) and INPUT(ATTACK_ANGLE) at the
-            // per-dab evaluation. With viewrotation = 0 the ascension
-            // wraps into `(-180, 180]` exactly like libmypaint's
-            // `mod_arith(... + 180, 360) - 180`.
-            let asc_wrapped = mod_arith_c(state.ascension + 180.0, 360.0) - 180.0;
+            // C:710: rotate the interpolated ascension input.
+            let asc_wrapped = mod_arith_c(state.ascension + viewrotation + 180.0, 360.0) - 180.0;
             dab_inputs.set(BrushInput::TiltDeclination, state.declination);
             dab_inputs.set(BrushInput::TiltAscension, asc_wrapped);
             dab_inputs.set(BrushInput::TiltDeclinationX, state.declination_x);
@@ -511,11 +517,15 @@ impl Brush {
             // direction we seeded `inputs` with.
             dab_inputs.set(
                 BrushInput::Direction,
-                direction_input(state.direction_dx, state.direction_dy),
+                direction_input(state.direction_dx, state.direction_dy, viewrotation),
             );
             dab_inputs.set(
                 BrushInput::DirectionAngle,
-                direction_angle(state.direction_angle_dx, state.direction_angle_dy),
+                direction_angle(
+                    state.direction_angle_dx,
+                    state.direction_angle_dy,
+                    viewrotation,
+                ),
             );
 
             // libmypaint computes GRIDMAP_X / GRIDMAP_Y from the (lagged)
@@ -524,32 +534,31 @@ impl Brush {
             // gridmap state update runs BEFORE this step's evaluation, so
             // SETTING() holds the previous step's values — read them from
             // the carried `prev_settings`.
-            const GRID_SIZE: f32 = 256.0;
-            let gscale = state
-                .prev_settings
-                .get(BrushSetting::GridmapScale)
-                .exp()
-                .max(1e-3);
-            let gscale_x = state.prev_settings.get(BrushSetting::GridmapScaleX);
-            let gscale_y = state.prev_settings.get(BrushSetting::GridmapScaleY);
-            let scaled_size = gscale * GRID_SIZE;
-            let mut gx =
-                (cur_ax * gscale_x).abs().rem_euclid(scaled_size) / scaled_size * GRID_SIZE;
-            let mut gy =
-                (cur_ay * gscale_y).abs().rem_euclid(scaled_size) / scaled_size * GRID_SIZE;
-            if cur_ax < 0.0 {
-                gx = GRID_SIZE - gx;
+            if grid_axes != 0 {
+                const GRID_SIZE: f32 = 256.0;
+                let gscale = state
+                    .prev_settings
+                    .get(BrushSetting::GridmapScale)
+                    .exp()
+                    .max(1e-3);
+                let gscale_x = state.prev_settings.get(BrushSetting::GridmapScaleX);
+                let gscale_y = state.prev_settings.get(BrushSetting::GridmapScaleY);
+                let (gx, gy) = surface.get_gridmap(
+                    cur_ax,
+                    cur_ay,
+                    gscale_x,
+                    gscale_y,
+                    gscale * GRID_SIZE,
+                    grid_axes,
+                );
+                dab_inputs.set(BrushInput::GridmapX, gx.clamp(0.0, GRID_SIZE));
+                dab_inputs.set(BrushInput::GridmapY, gy.clamp(0.0, GRID_SIZE));
             }
-            if cur_ay < 0.0 {
-                gy = GRID_SIZE - gy;
-            }
-            dab_inputs.set(BrushInput::GridmapX, gx.clamp(0.0, GRID_SIZE));
-            dab_inputs.set(BrushInput::GridmapY, gy.clamp(0.0, GRID_SIZE));
 
             let dab_sv = evaluate(self, &dab_inputs);
             // Mirrors libmypaint's `print_inputs` debug hook (enable both
             // sides with HOKUSAI_TRACE_INPUTS=1 and paste-diff the streams).
-            if std::env::var("HOKUSAI_TRACE_INPUTS").is_ok() {
+            if *TRACE_INPUTS {
                 eprintln!(
                     "press={:6.3}, speed1={:7.4}\tspeed2={:7.4}\tstroke={:6.3}\tcustom={:6.3}\tdir={:6.3}\tdec={:6.3}\tasc={:6.3}\trand={:6.3}\tattack={:6.3}",
                     dab_inputs.get(BrushInput::Pressure),
@@ -600,15 +609,17 @@ impl Brush {
 
             let dir_filter_d = dab_sv.get(BrushSetting::DirectionFilter).max(0.0);
             let dir_time_const = (dir_filter_d * 0.5).exp() - 1.0;
-            let step_in_dabtime = step_dx.hypot(step_dy);
+            let dir_dx = step_dx * context.view_zoom;
+            let dir_dy = step_dy * context.view_zoom;
+            let step_in_dabtime = dir_dx.hypot(dir_dy);
             let dir_fac = if dir_time_const > 1e-3 {
                 1.0 - (-step_in_dabtime / dir_time_const).exp()
             } else {
                 1.0
             };
-            state.direction_angle_dx += (step_dx - state.direction_angle_dx) * dir_fac;
-            state.direction_angle_dy += (step_dy - state.direction_angle_dy) * dir_fac;
-            let (mut dx_for_dir, mut dy_for_dir) = (step_dx, step_dy);
+            state.direction_angle_dx += (dir_dx - state.direction_angle_dx) * dir_fac;
+            state.direction_angle_dy += (dir_dy - state.direction_angle_dy) * dir_fac;
+            let (mut dx_for_dir, mut dy_for_dir) = (dir_dx, dir_dy);
             let dx_old = state.direction_dx;
             let dy_old = state.direction_dy;
             let pos_dist = (dx_old - dx_for_dir).powi(2) + (dy_old - dy_for_dir).powi(2);
@@ -654,15 +665,12 @@ impl Brush {
             let cust_target = dab_sv.get(BrushSetting::CustomInput);
             state.custom_input += (cust_target - state.custom_input) * cust_fac;
 
-            // STATE.ACTUAL_ELLIPTICAL_DAB_* ← fresh SETTING values
-            // (mypaint-brush.c:807-809). The angle is folded into
-            // `[-180, 0)` via mod_arith(angle + 180, 180) - 180 with
-            // viewrotation = 0; count_dabs_to and the dab mask are
-            // 180°-symmetric so the fold itself is harmless, but the
-            // carried values must match libmypaint's.
+            // C:807-809: use the same rotated ellipse for counting and drawing.
             state.actual_elliptical_ratio = dab_sv.get(BrushSetting::EllipticalDabRatio);
-            state.actual_elliptical_angle =
-                mod_arith_c(dab_sv.get(BrushSetting::EllipticalDabAngle) + 180.0, 180.0) - 180.0;
+            state.actual_elliptical_angle = mod_arith_c(
+                dab_sv.get(BrushSetting::EllipticalDabAngle) - viewrotation + 180.0,
+                180.0,
+            ) - 180.0;
 
             // Mirror of libmypaint's `settings_value[]`: keep the full
             // evaluation for the next step's delayed reads (DABS_PER_*,
@@ -689,10 +697,8 @@ impl Brush {
                 state.flip,
                 state.direction_angle_dx,
                 state.direction_angle_dy,
-                // ASCENSION isn't tracked per-dab yet (libmypaint smooths
-                // it like position); use the event-level tilt_ascension
-                // we already computed.
                 state.ascension,
+                viewrotation,
             );
             px += off_x;
             py += off_y;
@@ -737,10 +743,10 @@ impl Brush {
             }
             let off_speed = dab_sv.get(BrushSetting::OffsetBySpeed);
             if off_speed != 0.0 {
-                // libmypaint: `x += NORM_DX_SLOW * offset_by_speed * 0.1 /
-                // viewzoom`. Viewzoom is 1.0 here.
-                px += state.norm_dx_slow * off_speed * 0.1;
-                py += state.norm_dy_slow * off_speed * 0.1;
+                // C:1003-1004: convert filtered view velocity back to
+                // surface coordinates.
+                px += state.norm_dx_slow * off_speed * 0.1 / context.view_zoom;
+                py += state.norm_dy_slow * off_speed * 0.1 / context.view_zoom;
             }
 
             // libmypaint's `update_smudge_color`: lazy canvas resample
@@ -911,6 +917,7 @@ impl Brush {
         state.actual_dab_y = cur_ay;
         if painted {
             state.stroke_total_painting_time += dtime;
+            state.stroke_current_idling_time = 0.0;
         } else {
             state.stroke_current_idling_time += dtime;
         }
@@ -940,16 +947,20 @@ impl Brush {
         // last received value so brushes whose `opaque` is pressure-driven
         // keep painting along the trailing segment.
         let p = state.last_pressure;
+        let context = state.mynote.last_input_context;
+        let xtilt = state.mynote.last_xtilt;
+        let ytilt = state.mynote.last_ytilt;
         for _ in 0..8 {
-            painted |= self.stroke_to(
+            painted |= self.stroke_to_with_context(
                 state,
                 surface,
                 state.last_event_x,
                 state.last_event_y,
                 p,
-                0.0,
-                0.0,
+                xtilt,
+                ytilt,
                 0.016,
+                context,
             );
             let lag = ((state.last_event_x - state.actual_x).powi(2)
                 + (state.last_event_y - state.actual_y).powi(2))
@@ -1304,9 +1315,7 @@ fn count_dabs_to(
 /// clamped to ±3240 px to match libmypaint's safety net against runaway
 /// memory use from extreme settings.
 ///
-/// `viewrotation` is hard-coded to 0 — hokusai's `stroke_to` doesn't
-/// take a canvas rotation, so the `*_view` directions reduce to the
-/// world-x axis.
+/// View rotation is the C-normalized angle in degrees.
 #[allow(clippy::too_many_arguments)]
 fn directional_offsets(
     sv: &SettingValues,
@@ -1315,6 +1324,7 @@ fn directional_offsets(
     direction_angle_dx: f32,
     direction_angle_dy: f32,
     ascension_deg: f32,
+    viewrotation: f32,
 ) -> (f32, f32) {
     let offset_mult = sv.get(BrushSetting::OffsetMultiplier).exp();
     if !offset_mult.is_finite() {
@@ -1334,7 +1344,6 @@ fn directional_offsets(
     // pixels) before landing on the canvas.
     let angle_deg =
         ((degrees_c(direction_angle_dy.atan2(direction_angle_dx)) - 90.0) as f32) % 360.0;
-    let viewrotation = 0.0_f32;
 
     #[inline]
     fn add_polar(dx: &mut f32, dy: &mut f32, angle: f32, factor: f32) {
@@ -1387,30 +1396,6 @@ fn directional_offsets(
     )
 }
 
-/// C `DEGREES(x)` — `((x) / (2*M_PI)) * 360.0` — evaluated in DOUBLE.
-/// Callers narrow back to f32 at their own assignment points, exactly
-/// like the C expression contexts.
-#[inline]
-fn degrees_c(x: f32) -> f64 {
-    x as f64 / (2.0 * std::f64::consts::PI) * 360.0
-}
-
-/// C `RADIANS(x)` — `((x) * M_PI / 180.0)` in double, narrowed to f32 at
-/// the assignment site like every C caller does.
-#[inline]
-fn radians_c(x: f32) -> f32 {
-    (x as f64 * std::f64::consts::PI / 180.0) as f32
-}
-
-/// C `mod_arith(a, N)` (helpers.c:75): `a - N * floor(a / N)` — the
-/// division happens in f32, `floor` promotes to double, and the final
-/// multiply/subtract round once at the f32 narrowing. NOT the same
-/// rounding as `f32::rem_euclid` (which is fmod-based).
-#[inline]
-fn mod_arith_c(a: f32, n: f32) -> f32 {
-    (a as f64 - n as f64 * (a / n).floor() as f64) as f32
-}
-
 /// Smallest signed angular difference `b - a` (in degrees) — port of
 /// helpers.c `smallest_angular_difference`, including its post-wrap
 /// correction branch.
@@ -1455,23 +1440,17 @@ fn speed_input(speed_norm: f32, gamma_log: f32) -> f32 {
     (((gamma + speed_norm) as f64).ln() * m as f64 + q as f64) as f32
 }
 
-/// libmypaint's `INPUT(DIRECTION)` — 180°-folded direction in *degrees*.
-/// `mod_arith(degrees(atan2(dy, dx)) + viewrotation + 180, 180)` with
-/// `viewrotation = 0`. The output range is `[0, 180)`; declared as
-/// `hard_minimum=0, hard_maximum=180` in libmypaint's
-/// `brushsettings.json`.
-fn direction_input(dx: f32, dy: f32) -> f32 {
-    mod_arith_c((degrees_c(dy.atan2(dx)) + 180.0) as f32, 180.0)
+/// C:705: 180-degree-folded direction, corrected for view rotation.
+fn direction_input(dx: f32, dy: f32, viewrotation: f32) -> f32 {
+    mod_arith_c(
+        (degrees_c(dy.atan2(dx)) + viewrotation as f64 + 180.0) as f32,
+        180.0,
+    )
 }
 
-/// libmypaint's `INPUT(DIRECTION_ANGLE)` — full 360° direction in *degrees*.
-/// `fmodf(degrees(atan2(dy, dx)) + viewrotation + 360, 360)` with
-/// `viewrotation = 0`. Output range `[0, 360)`.
-fn direction_angle(dx: f32, dy: f32) -> f32 {
-    // C: `fmodf(DEGREES(dir_angle_360) + viewrotation + 360.0, 360.0)` —
-    // fmod, not euclidean mod (atan2 output + 360 is never negative
-    // anyway).
-    ((degrees_c(dy.atan2(dx)) + 360.0) as f32) % 360.0
+/// C:707: full direction uses fmodf (not euclidean modulo).
+fn direction_angle(dx: f32, dy: f32, viewrotation: f32) -> f32 {
+    ((degrees_c(dy.atan2(dx)) + viewrotation as f64 + 360.0) as f32) % 360.0
 }
 
 #[cfg(test)]

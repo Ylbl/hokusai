@@ -15,6 +15,7 @@ readme = "../../README.md"
 default = ["std"]
 std = []
 spectral = []
+reference-probe = []
 
 [dependencies]
 thiserror = { workspace = true }

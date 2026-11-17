@@ -37,6 +37,52 @@ pub trait TiledSurface {
         Vec::new()
     }
 
+    /// Per-event view and pen context; existing upstream consumers remain neutral.
+    fn stroke_input_context(&self) -> crate::mynote_ext::StrokeInputContext {
+        crate::mynote_ext::StrokeInputContext::default()
+    }
+
+    /// Required grid axes. Hosts may cache immutable brush requirements; the
+    /// default preserves upstream's evaluation of both local-coordinate inputs.
+    fn gridmap_axes(&self) -> u8 {
+        3
+    }
+
+    /// Resolve the requested absolute grid inputs in the surface's coordinate
+    /// frame. Bit 0 selects X and bit 1 Y; unrequested values are unused.
+    /// World-indexed hosts override this instead of converting large origins
+    /// to f32. The default retains the upstream local-frame arithmetic.
+    fn get_gridmap(
+        &self,
+        x: f32,
+        y: f32,
+        scale_x: f32,
+        scale_y: f32,
+        period: f32,
+        axes: u8,
+    ) -> (f32, f32) {
+        fn phase(value: f32, scale: f32, period: f32) -> f32 {
+            let phase = (value * scale).abs().rem_euclid(period) / period * 256.0;
+            if value < 0.0 {
+                256.0 - phase
+            } else {
+                phase
+            }
+        }
+        (
+            if axes & 1 != 0 {
+                phase(x, scale_x, period)
+            } else {
+                0.0
+            },
+            if axes & 2 != 0 {
+                phase(y, scale_y, period)
+            } else {
+                0.0
+            },
+        )
+    }
+
     /// Render one dab. Returns whether any pixel was modified.
     ///
     /// Default impl applies libmypaint's Normal+Eraser blend in linear sRGB

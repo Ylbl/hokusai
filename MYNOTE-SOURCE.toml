@@ -1,0 +1,21 @@
+upstream = "https://github.com/reearth/hokusai"
+fork = "https://github.com/Ylbl/hokusai"
+upstream_branch = "main"
+upstream_commit = "f7e998173c0e7427b95afe0b6947e3103da60f00"
+upstream_version = "0.3.0"
+update_strategy = "merge upstream/main into a candidate; publish only after the complete CI workflow succeeds"
+
+baseline_archive_url = "https://github.com/reearth/hokusai/archive/f7e998173c0e7427b95afe0b6947e3103da60f00.tar.gz"
+baseline_archive_sha256 = "8b9810ad510dd4802a3e23545d03e83aa3c7d07710417b13c5cdb2cae83884b4"
+baseline_source_tree_tar_sha256 = "7fe9987c8d6e2a029312b20d01c9863cf40c260eb85284669bd8bd2bb3118512"
+local_algorithm_modifications = true
+production_dependencies = ["crates/hokusai-core", "crates/hokusai-brush"]
+extension_module = "crates/hokusai-core/src/mynote_ext.rs"
+extension_abi = 1
+kernel_profile_owner = "MyNote src/brush/package.rs; semantic identity is not automatically bumped for source-only updates"
+local_patches = [
+    "core lib/surface: isolated extension module and optional context/grid callbacks; original public stroke_to signature is unchanged",
+    "core state: one sidecar context field/initializer; coordinate-frame adaptation remains outside Hokusai",
+    "core stroke: unique upstream simulation loop with context/grid hooks and source-backed C compatibility corrections",
+    "core Cargo/brushmodes: reference-probe-only seeded sampler/state observation; original no-argument reset API is preserved",
+]
